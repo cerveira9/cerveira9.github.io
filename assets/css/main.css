@@ -2712,7 +2712,7 @@ input, select, textarea {
 		background-repeat: repeat-x,						repeat,					no-repeat;
 		background-size: 3200px 460px,					auto,					cover;
 		color: rgba(255, 255, 255, 0.8);
-		padding: 5em 0 20em 0;
+		padding: 5em 0 10em 0;
 		position: relative;
 		text-align: center;
 	}
@@ -2783,15 +2783,15 @@ input, select, textarea {
 			}
 
 		#header h1 {
-			font-size: 1.8em;
+			font-size: 1.5em;
 
-			margin: 40px;
+			margin: 30px;
 		}
 
 		#header p {
 			font-size: 1.5em;
 			line-height: 1.5em;
-			margin: 0.25em 0 0 0;
+			margin: 0 0 0 0;
 		}
 
 /* Footer */
@@ -2955,11 +2955,11 @@ input, select, textarea {
 		/* Header */
 
 			#header {
-				padding: 8em 0 16em 0;
+				padding: 8em 0 10em 0;
 			}
 
 				#header h1 {
-					font-size: 2.25em;
+					font-size: 1.5em;
 				}
 
 				#header p {
