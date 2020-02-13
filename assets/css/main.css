@@ -2728,11 +2728,7 @@ input, select, textarea {
 
 		#header:before {
 			height: calc(100% - 50px);
-<<<<<<< HEAD
 			opacity: 0;
-=======
-			opacity: 0.15;
->>>>>>> acc4e51e3a1472cd8a68ab1e615878da7a0cef2f
 			top: 0;
 		}
 
@@ -2787,11 +2783,8 @@ input, select, textarea {
 			}
 
 		#header h1 {
-<<<<<<< HEAD
 			font-size: 1.8em;
-=======
-			font-size: 2.5em;
->>>>>>> acc4e51e3a1472cd8a68ab1e615878da7a0cef2f
+
 			margin: 40px;
 		}
 
