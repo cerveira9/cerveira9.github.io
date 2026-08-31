@@ -27,7 +27,10 @@ export async function getSupabase() {
   return clientPromise
 }
 
-export function isEmailAllowed(email) {
-  const list = getRuntimeConfig().allowedEmails
-  return list.length === 0 || list.includes(String(email || '').toLowerCase())
+export async function isCurrentUserOwner() {
+  const supabase = await getSupabase()
+  if (!supabase) return true
+  const { data, error } = await supabase.rpc('is_promptdeck_owner')
+  if (error) throw error
+  return data === true
 }
