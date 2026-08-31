@@ -1,7 +1,7 @@
 import { encryptVault, decryptVault } from './crypto/vault.js'
 import { createDemoPrompts } from './data/demo.js'
 import { exportEncryptedBackup, loadEncryptedVault, readEncryptedBackup, saveEncryptedVault } from './data/store.js'
-import { getSupabase, isEmailAllowed, isSupabaseConfigured } from './data/supabase.js'
+import { getSupabase, isCurrentUserOwner, isSupabaseConfigured } from './data/supabase.js'
 import { createPrompt, initialValues, renderPrompt } from './domain/template.js'
 import { appView, authView, configureModal, deniedView, editorModal, escapeHtml, variableEditorCard, vaultGateView } from './ui/render.js'
 
@@ -20,6 +20,7 @@ const state = {
   activePromptId: null,
   localMode: !isSupabaseConfigured(),
   busy: false,
+  ownerAccess: null,
   error: '',
   lastActivityAt: Date.now()
 }
@@ -37,14 +38,24 @@ async function boot() {
   supabase.auth.onAuthStateChange((_event, session) => {
     state.session = session
     state.user = session?.user || null
-    route()
+    state.ownerAccess = null
+    queueMicrotask(() => { void route() })
   })
-  route()
+  await route()
 }
 
-function route() {
+async function route() {
   if (!state.localMode && !state.user) return renderAuth()
-  if (!state.localMode && !isEmailAllowed(state.user.email)) return renderDenied()
+  if (!state.localMode) {
+    try {
+      if (state.ownerAccess === null) state.ownerAccess = await isCurrentUserOwner()
+      if (!state.ownerAccess) return renderDenied()
+    } catch (error) {
+      console.error(error)
+      root.innerHTML = '<main class="gate-screen"><section class="gate-card"><h1>Falha ao validar acesso</h1><p>Não foi possível confirmar a identidade proprietária. Tente novamente.</p></section></main>'
+      return
+    }
+  }
   if (!state.secret) return renderVaultGate()
   renderApp()
 }
@@ -257,7 +268,14 @@ function bindAutoLock() {
 
 function closeModal() { document.querySelector('#modalBackdrop')?.remove(); state.activePromptId = null }
 function lockVault() { state.secret = ''; state.prompts = []; state.vaultId = null; state.envelope = null; state.error = ''; state.lastActivityAt = Date.now(); renderVaultGate() }
-async function signOut() { lockVault(); if (!state.localMode) { const supabase = await getSupabase(); await supabase.auth.signOut() } else renderVaultGate() }
+async function signOut() {
+  state.ownerAccess = null
+  lockVault()
+  if (!state.localMode) {
+    const supabase = await getSupabase()
+    await supabase.auth.signOut()
+  } else renderVaultGate()
+}
 function notify(message) { toastElement.textContent = message; toastElement.hidden = false; clearTimeout(notify.timer); notify.timer = setTimeout(() => { toastElement.hidden = true }, 1800) }
 
 boot().catch(error => { console.error(error); root.innerHTML = `<main class="gate-screen"><section class="gate-card"><h1>Erro ao iniciar</h1><p>${escapeHtml(error.message)}</p></section></main>` })
