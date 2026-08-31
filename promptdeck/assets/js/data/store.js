@@ -41,7 +41,9 @@ export async function saveEncryptedVault({ userId, vaultId, envelope }) {
     .maybeSingle()
   if (error) throw error
   if (!data) {
-    const conflict = new Error('O Vault foi alterado em outro dispositivo. Recarregue antes de salvar novamente.')
+    window.alert('O PromptDeck foi alterado em outro dispositivo. A página será recarregada para evitar sobrescrever essas mudanças.')
+    window.location.reload()
+    const conflict = new Error('Vault revision conflict')
     conflict.code = 'VAULT_CONFLICT'
     throw conflict
   }
