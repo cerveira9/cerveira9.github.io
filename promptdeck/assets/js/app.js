@@ -1,12 +1,14 @@
 import { encryptVault, decryptVault } from './crypto/vault.js'
-import { createDemoPrompts } from './data/demo.js'
 import { exportEncryptedBackup, loadEncryptedVault, readEncryptedBackup, saveEncryptedVault } from './data/store.js'
 import { getSupabase, isCurrentUserOwner, isSupabaseConfigured } from './data/supabase.js'
-import { createPrompt, initialValues, renderPrompt } from './domain/template.js'
-import { appView, authView, configureModal, deniedView, editorModal, escapeHtml, variableEditorCard, vaultGateView } from './ui/render.js'
+import { createPrompt, defaultValues, initialValues, normalizePrompt, promptSnapshot, renderPrompt, restoreSnapshot } from './domain/template.js'
+import { appView, authView, configureModal, deniedView, editorModal, escapeHtml, textImportModal, variableEditorCard, versionsModal, vaultGateView } from './ui/render.js'
 
 const root = document.querySelector('#app')
 const toastElement = document.querySelector('#toast')
+const AUTO_LOCK_MS = 15 * 60 * 1000
+const MAX_HISTORY = 60
+const MAX_VERSIONS = 20
 
 const state = {
   session: null,
@@ -15,9 +17,9 @@ const state = {
   vaultId: null,
   envelope: null,
   prompts: [],
+  copyHistory: [],
   query: '',
-  filter: 'all',
-  activePromptId: null,
+  filter: 'quick',
   localMode: !isSupabaseConfigured(),
   busy: false,
   ownerAccess: null,
@@ -25,11 +27,9 @@ const state = {
   lastActivityAt: Date.now()
 }
 
-const AUTO_LOCK_MS = 15 * 60 * 1000
-
 async function boot() {
   bindAutoLock()
-  if ('serviceWorker' in navigator && location.protocol === 'https:') navigator.serviceWorker.register('./sw.js').catch(() => {})
+  registerServiceWorker()
   if (state.localMode) return renderVaultGate()
   const supabase = await getSupabase()
   const { data } = await supabase.auth.getSession()
@@ -65,7 +65,8 @@ function renderAuth() {
   document.querySelector('#signInButton').addEventListener('click', async () => {
     const supabase = await getSupabase()
     const redirectTo = new URL('.', window.location.href).href
-    await supabase.auth.signInWithOAuth({ provider: 'google', options: { redirectTo } })
+    const { error } = await supabase.auth.signInWithOAuth({ provider: 'google', options: { redirectTo } })
+    if (error) notify('Falha ao iniciar login Google')
   })
 }
 
@@ -79,11 +80,14 @@ function renderVaultGate() {
   document.querySelector('#vaultForm').addEventListener('submit', async (event) => {
     event.preventDefault()
     const secret = document.querySelector('#vaultSecret').value
-    state.busy = true; state.error = ''; renderVaultGate()
+    state.busy = true
+    state.error = ''
+    renderVaultGate()
     try {
       await openVault(secret)
       state.secret = secret
       state.busy = false
+      state.lastActivityAt = Date.now()
       renderApp()
     } catch (error) {
       console.error(error)
@@ -95,73 +99,150 @@ function renderVaultGate() {
 }
 
 async function openVault(secret) {
-  const userId = state.user?.id
-  const stored = await loadEncryptedVault(userId)
+  const stored = await loadEncryptedVault(state.user?.id)
   if (!stored) {
-    const prompts = createDemoPrompts()
-    const envelope = await encryptVault({ version: 1, prompts }, secret)
-    const created = await saveEncryptedVault({ userId, envelope })
-    state.vaultId = created.id; state.envelope = envelope; state.prompts = prompts
+    const envelope = await encryptVault({ version: 1, prompts: [], copyHistory: [] }, secret)
+    const created = await saveEncryptedVault({ userId: state.user?.id, envelope })
+    state.vaultId = created.id
+    state.envelope = envelope
+    state.prompts = []
+    state.copyHistory = []
     return
   }
   const payload = await decryptVault(stored.envelope, secret)
-  state.vaultId = stored.id; state.envelope = stored.envelope; state.prompts = payload.prompts
+  state.vaultId = stored.id
+  state.envelope = stored.envelope
+  state.prompts = (payload.prompts || []).map(normalizePrompt)
+  state.copyHistory = Array.isArray(payload.copyHistory) ? payload.copyHistory.slice(0, MAX_HISTORY) : []
 }
 
-async function persistPrompts() {
-  const envelope = await encryptVault({ version: 1, prompts: state.prompts }, state.secret)
+async function persistVault() {
+  const envelope = await encryptVault({ version: 1, prompts: state.prompts, copyHistory: state.copyHistory.slice(0, MAX_HISTORY) }, state.secret)
   const saved = await saveEncryptedVault({ userId: state.user?.id, vaultId: state.vaultId, envelope })
-  state.vaultId = saved.id; state.envelope = envelope
+  state.vaultId = saved.id
+  state.envelope = envelope
 }
 
 function renderApp() {
-  root.innerHTML = appView({ prompts: state.prompts, query: state.query, filter: state.filter, localMode: state.localMode, email: state.user?.email })
-  document.querySelector('#searchInput').addEventListener('input', (event) => { state.query = event.target.value; renderApp(); document.querySelector('#searchInput')?.focus() })
+  root.innerHTML = appView({ prompts: state.prompts, copyHistory: state.copyHistory, query: state.query, filter: state.filter, localMode: state.localMode, email: state.user?.email })
+  document.querySelector('#searchInput')?.addEventListener('input', (event) => {
+    state.query = event.target.value
+    renderApp()
+    document.querySelector('#searchInput')?.focus()
+  })
   document.querySelector('#newPromptButton')?.addEventListener('click', () => openEditor())
-  document.querySelectorAll('[data-library-filter]').forEach(button => button.addEventListener('click', () => { state.filter = button.dataset.libraryFilter; renderApp() }))
   document.querySelector('#fabButton')?.addEventListener('click', () => openEditor())
+  document.querySelectorAll('[data-library-filter]').forEach(button => button.addEventListener('click', () => {
+    state.filter = button.dataset.libraryFilter
+    state.query = ''
+    renderApp()
+  }))
   document.querySelector('#lockButton').addEventListener('click', lockVault)
   document.querySelector('#signOutButton').addEventListener('click', signOut)
   document.querySelector('#exportButton').addEventListener('click', () => state.envelope && exportEncryptedBackup(state.envelope))
   document.querySelector('#importButton')?.addEventListener('click', () => document.querySelector('#importFile')?.click())
   document.querySelector('#importFile')?.addEventListener('change', importBackup)
-  document.querySelectorAll('[data-action]').forEach(button => button.addEventListener('click', handleCardAction))
+  document.querySelector('#textImportButton')?.addEventListener('click', openTextImporter)
+  document.querySelectorAll('[data-action]').forEach(button => button.addEventListener('click', handleAction))
 }
 
-async function handleCardAction(event) {
+async function handleAction(event) {
   event.stopPropagation()
   const button = event.currentTarget
+  const action = button.dataset.action
+  if (action === 'copy-history') {
+    const entry = state.copyHistory.find(item => item.id === button.dataset.historyId)
+    if (entry) await copyText(entry.rendered, 'Copiado do histórico')
+    return
+  }
   const prompt = state.prompts.find(item => item.id === button.dataset.promptId)
   if (!prompt) return
-  const action = button.dataset.action
-  if (action === 'copy') return copyText(renderPrompt(prompt, initialValues(prompt)), prompt.variables?.length ? 'Copiado com valores padrão' : 'Prompt copiado')
+  if (action === 'copy') return copyAndRemember(prompt, initialValues(prompt), prompt.variables?.length ? 'Copiado com última configuração' : 'Prompt copiado')
   if (action === 'configure') return openConfigure(prompt)
   if (action === 'edit') return openEditor(prompt)
+  if (action === 'versions') return openVersions(prompt)
   if (action === 'favorite') {
-    prompt.favorite = !prompt.favorite; prompt.updatedAt = new Date().toISOString(); await persistPrompts(); renderApp(); notify(prompt.favorite ? 'Adicionado aos favoritos' : 'Removido dos favoritos')
+    prompt.favorite = !prompt.favorite
+    prompt.updatedAt = new Date().toISOString()
+    await persistVault()
+    renderApp()
+    notify(prompt.favorite ? 'Adicionado aos favoritos' : 'Removido dos favoritos')
   }
 }
 
+async function copyAndRemember(prompt, values, message) {
+  const rendered = renderPrompt(prompt, values)
+  await copyText(rendered, message)
+  prompt.lastValues = structuredClone(values)
+  prompt.lastUsedAt = new Date().toISOString()
+  prompt.updatedAt = prompt.updatedAt || prompt.lastUsedAt
+  state.copyHistory.unshift({ id: crypto.randomUUID(), promptId: prompt.id, title: prompt.title, rendered, createdAt: prompt.lastUsedAt })
+  state.copyHistory = state.copyHistory.slice(0, MAX_HISTORY)
+  try { await persistVault() } catch (error) { console.error(error); notify('Copiado; sincronização pendente') }
+}
+
 function openConfigure(prompt) {
-  state.activePromptId = prompt.id
   document.body.insertAdjacentHTML('beforeend', configureModal(prompt))
   const modal = document.querySelector('#modalBackdrop')
   const values = initialValues(prompt)
-  modal.addEventListener('click', (event) => { if (event.target === modal) closeModal() })
-  document.querySelector('#closeModalButton').addEventListener('click', closeModal)
-  modal.querySelectorAll('[data-variable-key]').forEach(field => field.addEventListener('input', () => {
-    const key = field.dataset.variableKey
-    values[key] = field.type === 'checkbox' ? field.checked : field.value
-    document.querySelector('#promptPreview').textContent = renderPrompt(prompt, values)
-  }))
-  document.querySelector('#copyConfiguredButton').addEventListener('click', () => copyText(renderPrompt(prompt, values), 'Prompt configurado e copiado'))
+  bindModalClose(modal)
+  const fields = [...modal.querySelectorAll('[data-variable-key]')]
+  const preview = document.querySelector('#promptPreview')
+  const presetSelect = document.querySelector('#presetSelect')
+  const deletePresetButton = document.querySelector('#deletePresetButton')
+  const refresh = () => { preview.textContent = renderPrompt(prompt, values) }
+  const readFields = () => {
+    fields.forEach(field => { values[field.dataset.variableKey] = field.type === 'checkbox' ? field.checked : field.value })
+    refresh()
+  }
+  const writeFields = (nextValues) => {
+    Object.assign(values, nextValues)
+    fields.forEach(field => {
+      const value = values[field.dataset.variableKey]
+      if (field.type === 'checkbox') field.checked = Boolean(value)
+      else field.value = value ?? ''
+    })
+    refresh()
+  }
+  fields.forEach(field => field.addEventListener('input', readFields))
+  presetSelect.addEventListener('change', () => {
+    const preset = (prompt.presets || []).find(item => item.id === presetSelect.value)
+    deletePresetButton.disabled = !preset
+    if (preset) writeFields({ ...defaultValues(prompt), ...preset.values })
+  })
+  document.querySelector('#resetValuesButton').addEventListener('click', () => {
+    presetSelect.value = ''
+    deletePresetButton.disabled = true
+    writeFields(defaultValues(prompt))
+  })
+  document.querySelector('#savePresetButton').addEventListener('click', async () => {
+    readFields()
+    const name = window.prompt('Nome do preset:')?.trim()
+    if (!name) return
+    prompt.presets = [...(prompt.presets || []), { id: crypto.randomUUID(), name, values: structuredClone(values), createdAt: new Date().toISOString() }].slice(-30)
+    await persistVault()
+    closeModal()
+    openConfigure(prompt)
+    notify('Preset salvo')
+  })
+  deletePresetButton.addEventListener('click', async () => {
+    if (!presetSelect.value) return
+    prompt.presets = (prompt.presets || []).filter(item => item.id !== presetSelect.value)
+    await persistVault()
+    closeModal()
+    openConfigure(prompt)
+    notify('Preset removido')
+  })
+  document.querySelector('#copyConfiguredButton').addEventListener('click', async () => {
+    readFields()
+    await copyAndRemember(prompt, values, 'Prompt configurado e copiado')
+  })
 }
 
 function openEditor(prompt = null) {
   document.body.insertAdjacentHTML('beforeend', editorModal(prompt))
   const modal = document.querySelector('#modalBackdrop')
-  modal.addEventListener('click', (event) => { if (event.target === modal) closeModal() })
-  document.querySelector('#closeModalButton').addEventListener('click', closeModal)
+  bindModalClose(modal)
   document.querySelector('#addVariableButton').addEventListener('click', () => {
     const container = document.querySelector('#variablesContainer')
     container.querySelector('.empty-mini')?.remove()
@@ -172,23 +253,103 @@ function openEditor(prompt = null) {
   document.querySelector('#savePromptButton').addEventListener('click', async () => {
     const data = collectEditorData(prompt)
     if (!data.title || !data.template) return notify('Título e template são obrigatórios')
-    const next = createPrompt(data)
-    if (prompt) state.prompts = state.prompts.map(item => item.id === prompt.id ? next : item)
-    else state.prompts = [next, ...state.prompts]
-    await persistPrompts(); closeModal(); renderApp(); notify(prompt ? 'Prompt atualizado' : 'Prompt salvo no cofre')
+    if (prompt) {
+      const versions = [...(prompt.versions || []), promptSnapshot(prompt)].slice(-MAX_VERSIONS)
+      const next = createPrompt({ ...data, versions, presets: prompt.presets, lastValues: prompt.lastValues, lastUsedAt: prompt.lastUsedAt })
+      state.prompts = state.prompts.map(item => item.id === prompt.id ? next : item)
+    } else {
+      state.prompts = [createPrompt(data), ...state.prompts]
+    }
+    await persistVault()
+    closeModal()
+    renderApp()
+    notify(prompt ? 'Prompt atualizado; versão anterior preservada' : 'Prompt salvo no cofre')
   })
   document.querySelector('#deletePromptButton')?.addEventListener('click', async () => {
     if (!confirm(`Excluir “${prompt.title}”?`)) return
     state.prompts = state.prompts.filter(item => item.id !== prompt.id)
-    await persistPrompts(); closeModal(); renderApp(); notify('Prompt excluído')
+    await persistVault()
+    closeModal()
+    renderApp()
+    notify('Prompt excluído')
   })
+}
+
+function openVersions(prompt) {
+  document.body.insertAdjacentHTML('beforeend', versionsModal(prompt))
+  const modal = document.querySelector('#modalBackdrop')
+  bindModalClose(modal)
+  document.querySelector('#closeVersionsButton')?.addEventListener('click', closeModal)
+  modal.querySelectorAll('[data-action="restore-version"]').forEach(button => button.addEventListener('click', async () => {
+    const snapshot = (prompt.versions || []).find(item => item.id === button.dataset.versionId)
+    if (!snapshot || !confirm('Restaurar esta versão? A versão atual também será preservada.')) return
+    const versions = [...(prompt.versions || []), promptSnapshot(prompt)].slice(-MAX_VERSIONS)
+    const restored = restoreSnapshot({ ...prompt, versions }, snapshot)
+    restored.versions = versions
+    state.prompts = state.prompts.map(item => item.id === prompt.id ? restored : item)
+    await persistVault()
+    closeModal()
+    renderApp()
+    notify('Versão restaurada')
+  }))
+}
+
+function openTextImporter() {
+  document.body.insertAdjacentHTML('beforeend', textImportModal())
+  const modal = document.querySelector('#modalBackdrop')
+  bindModalClose(modal)
+  document.querySelector('#runImportButton').addEventListener('click', async () => {
+    const text = document.querySelector('#importText').value.trim()
+    const mode = document.querySelector('#importMode').value
+    const category = document.querySelector('#importCategory').value.trim() || 'Importado'
+    const tags = document.querySelector('#importTags').value.split(',').map(tag => tag.trim()).filter(Boolean)
+    const title = document.querySelector('#importTitle').value.trim()
+    if (!text) return notify('Cole algum texto para importar')
+    const drafts = parseImportedText({ text, mode, title, category, tags })
+    if (!drafts.length) return notify('Nenhum prompt identificado')
+    if (!confirm(`Importar ${drafts.length} prompt(s) para o Vault?`)) return
+    state.prompts = [...drafts.map(createPrompt), ...state.prompts]
+    await persistVault()
+    closeModal()
+    state.filter = 'all'
+    renderApp()
+    notify(`${drafts.length} prompt(s) importado(s)`)
+  })
+}
+
+function parseImportedText({ text, mode, title, category, tags }) {
+  if (mode === 'single') return [{ title: title || 'Prompt importado', description: 'Importado de texto', category, tags, template: text, variables: [] }]
+  if (mode === 'separator') return text.split(/^\s*-{3,}\s*$/m).map(part => part.trim()).filter(Boolean).map((part,index) => ({ title: firstLineTitle(part, `Prompt importado ${index + 1}`), description: 'Importado de texto', category, tags, template: part, variables: [] }))
+  const lines = text.split(/\r?\n/)
+  const groups = []
+  let current = null
+  for (const line of lines) {
+    const match = line.match(/^#{1,2}\s+(.+)$/)
+    if (match) {
+      if (current && current.body.join('\n').trim()) groups.push(current)
+      current = { title: match[1].trim(), body: [] }
+    } else {
+      if (!current) current = { title: '', body: [] }
+      current.body.push(line)
+    }
+  }
+  if (current && current.body.join('\n').trim()) groups.push(current)
+  return groups.map((group,index) => ({ title: group.title || `Prompt importado ${index + 1}`, description: 'Importado de texto', category, tags, template: group.body.join('\n').trim(), variables: [] }))
+}
+
+function firstLineTitle(text, fallback) {
+  const first = text.split(/\r?\n/).map(line => line.trim()).find(Boolean)
+  return first && first.length <= 80 ? first.replace(/^#+\s*/, '') : fallback
 }
 
 function bindVariableCards() {
   document.querySelectorAll('.variable-card').forEach(card => {
     card.querySelector('[data-action="remove-variable"]')?.addEventListener('click', () => card.remove())
     card.querySelector('[data-var="type"]')?.addEventListener('change', (event) => { card.querySelector('.options-field').hidden = event.target.value !== 'select' })
-    card.querySelector('[data-var="key"]')?.addEventListener('input', (event) => { event.target.value = event.target.value.toLowerCase().replace(/[^a-z0-9_]/g, '_'); card.querySelector('.hint code').textContent = `{{${event.target.value || 'chave'}}}` })
+    card.querySelector('[data-var="key"]')?.addEventListener('input', (event) => {
+      event.target.value = event.target.value.toLowerCase().replace(/[^a-z0-9_]/g, '_')
+      card.querySelector('.hint code').textContent = `{{${event.target.value || 'chave'}}}`
+    })
   })
 }
 
@@ -201,7 +362,7 @@ function collectEditorData(existing) {
       return { label: label.trim(), value }
     }) : []
     let defaultValue = card.querySelector('[data-var="default"]').value
-    if (type === 'toggle') defaultValue = ['true', '1', 'sim', 'yes'].includes(defaultValue.toLowerCase())
+    if (type === 'toggle') defaultValue = ['true','1','sim','yes'].includes(defaultValue.toLowerCase())
     return { id: card.dataset.variableId, label: card.querySelector('[data-var="label"]').value.trim(), key: card.querySelector('[data-var="key"]').value.trim(), type, defaultValue, options }
   }).filter(variable => variable.label && variable.key)
   return {
@@ -242,22 +403,30 @@ async function importBackup(event) {
   try {
     const envelope = await readEncryptedBackup(file)
     const payload = await decryptVault(envelope, state.secret)
-    if (!confirm(`Importar backup com ${payload.prompts.length} prompt(s) e substituir o cofre atual?`)) return
+    const prompts = (payload.prompts || []).map(normalizePrompt)
+    if (!confirm(`Restaurar backup com ${prompts.length} prompt(s) e substituir o Vault atual?`)) return
     const saved = await saveEncryptedVault({ userId: state.user?.id, vaultId: state.vaultId, envelope })
     state.vaultId = saved.id
     state.envelope = envelope
-    state.prompts = payload.prompts
+    state.prompts = prompts
+    state.copyHistory = Array.isArray(payload.copyHistory) ? payload.copyHistory.slice(0, MAX_HISTORY) : []
+    state.filter = 'quick'
     renderApp()
-    notify('Backup importado com sucesso')
+    notify('Backup restaurado com sucesso')
   } catch (error) {
     console.error(error)
-    notify('Não foi possível importar o backup')
+    notify('Não foi possível restaurar o backup')
   }
+}
+
+function bindModalClose(modal) {
+  modal.addEventListener('click', (event) => { if (event.target === modal) closeModal() })
+  document.querySelector('#closeModalButton')?.addEventListener('click', closeModal)
 }
 
 function bindAutoLock() {
   const markActivity = () => { state.lastActivityAt = Date.now() }
-  for (const eventName of ['pointerdown', 'keydown', 'touchstart', 'focus']) window.addEventListener(eventName, markActivity, { passive: true })
+  for (const eventName of ['pointerdown','keydown','touchstart','focus']) window.addEventListener(eventName, markActivity, { passive: true })
   setInterval(() => {
     if (state.secret && Date.now() - state.lastActivityAt >= AUTO_LOCK_MS) {
       lockVault()
@@ -266,16 +435,37 @@ function bindAutoLock() {
   }, 30_000)
 }
 
-function closeModal() { document.querySelector('#modalBackdrop')?.remove(); state.activePromptId = null }
-function lockVault() { state.secret = ''; state.prompts = []; state.vaultId = null; state.envelope = null; state.error = ''; state.lastActivityAt = Date.now(); renderVaultGate() }
+function registerServiceWorker() {
+  if (!('serviceWorker' in navigator) || location.protocol !== 'https:') return
+  navigator.serviceWorker.register('./sw.js').then(registration => registration.update()).catch(() => {})
+}
+
+function closeModal() { document.querySelector('#modalBackdrop')?.remove() }
+function lockVault() {
+  state.secret = ''
+  state.prompts = []
+  state.copyHistory = []
+  state.vaultId = null
+  state.envelope = null
+  state.error = ''
+  state.lastActivityAt = Date.now()
+  renderVaultGate()
+}
 async function signOut() {
-  state.ownerAccess = null
   lockVault()
   if (!state.localMode) {
     const supabase = await getSupabase()
     await supabase.auth.signOut()
   } else renderVaultGate()
 }
-function notify(message) { toastElement.textContent = message; toastElement.hidden = false; clearTimeout(notify.timer); notify.timer = setTimeout(() => { toastElement.hidden = true }, 1800) }
+function notify(message) {
+  toastElement.textContent = message
+  toastElement.hidden = false
+  clearTimeout(notify.timer)
+  notify.timer = setTimeout(() => { toastElement.hidden = true }, 1900)
+}
 
-boot().catch(error => { console.error(error); root.innerHTML = `<main class="gate-screen"><section class="gate-card"><h1>Erro ao iniciar</h1><p>${escapeHtml(error.message)}</p></section></main>` })
+boot().catch(error => {
+  console.error(error)
+  root.innerHTML = `<main class="gate-screen"><section class="gate-card"><h1>Erro ao iniciar</h1><p>${escapeHtml(error.message)}</p></section></main>`
+})
