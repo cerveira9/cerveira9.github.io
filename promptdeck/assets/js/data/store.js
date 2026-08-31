@@ -8,25 +8,38 @@ export async function loadEncryptedVault(userId) {
     return raw ? JSON.parse(raw) : null
   }
   const supabase = await getSupabase()
-  const { data, error } = await supabase.from('vaults').select('id,envelope').eq('user_id', userId).maybeSingle()
+  const { data, error } = await supabase.from('vaults').select('id,envelope,revision').eq('user_id', userId).maybeSingle()
   if (error) throw error
-  return data ? { id: data.id, envelope: data.envelope } : null
+  return data ? { id: data.id, envelope: data.envelope, revision: Number(data.revision || 0) } : null
 }
 
-export async function saveEncryptedVault({ userId, vaultId, envelope }) {
+export async function saveEncryptedVault({ userId, vaultId, envelope, revision = 0 }) {
   if (!isSupabaseConfigured()) {
-    const stored = { id: vaultId || 'local', envelope }
+    const stored = { id: vaultId || 'local', envelope, revision: Number(revision || 0) + 1 }
     localStorage.setItem(LOCAL_STORAGE_KEY, JSON.stringify(stored))
     return stored
   }
   const supabase = await getSupabase()
-  const payload = { user_id: userId, envelope, updated_at: new Date().toISOString() }
-  const query = vaultId
-    ? supabase.from('vaults').update(payload).eq('id', vaultId).eq('user_id', userId).select('id,envelope').single()
-    : supabase.from('vaults').insert(payload).select('id,envelope').single()
-  const { data, error } = await query
+  if (!vaultId) {
+    const { data, error } = await supabase.from('vaults').insert({ user_id: userId, envelope, revision: 0, updated_at: new Date().toISOString() }).select('id,envelope,revision').single()
+    if (error) throw error
+    return { id: data.id, envelope: data.envelope, revision: Number(data.revision || 0) }
+  }
+  const nextRevision = Number(revision || 0) + 1
+  const { data, error } = await supabase.from('vaults')
+    .update({ envelope, revision: nextRevision, updated_at: new Date().toISOString() })
+    .eq('id', vaultId)
+    .eq('user_id', userId)
+    .eq('revision', Number(revision || 0))
+    .select('id,envelope,revision')
+    .maybeSingle()
   if (error) throw error
-  return { id: data.id, envelope: data.envelope }
+  if (!data) {
+    const conflict = new Error('O Vault foi alterado em outro dispositivo. Recarregue antes de salvar novamente.')
+    conflict.code = 'VAULT_CONFLICT'
+    throw conflict
+  }
+  return { id: data.id, envelope: data.envelope, revision: Number(data.revision || nextRevision) }
 }
 
 export function exportEncryptedBackup(envelope) {
