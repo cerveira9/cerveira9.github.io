@@ -1,21 +1,26 @@
 import { getSupabase, isSupabaseConfigured } from './supabase.js'
 
 const LOCAL_STORAGE_KEY = 'promptdeck.local.encrypted-vault'
+let loadedRevision = 0
 
 export async function loadEncryptedVault(userId) {
   if (!isSupabaseConfigured()) {
     const raw = localStorage.getItem(LOCAL_STORAGE_KEY)
-    return raw ? JSON.parse(raw) : null
+    const stored = raw ? JSON.parse(raw) : null
+    loadedRevision = Number(stored?.revision || 0)
+    return stored
   }
   const supabase = await getSupabase()
   const { data, error } = await supabase.from('vaults').select('id,envelope,revision').eq('user_id', userId).maybeSingle()
   if (error) throw error
-  return data ? { id: data.id, envelope: data.envelope, revision: Number(data.revision || 0) } : null
+  loadedRevision = Number(data?.revision || 0)
+  return data ? { id: data.id, envelope: data.envelope, revision: loadedRevision } : null
 }
 
-export async function saveEncryptedVault({ userId, vaultId, envelope, revision = 0 }) {
+export async function saveEncryptedVault({ userId, vaultId, envelope }) {
   if (!isSupabaseConfigured()) {
-    const stored = { id: vaultId || 'local', envelope, revision: Number(revision || 0) + 1 }
+    loadedRevision += 1
+    const stored = { id: vaultId || 'local', envelope, revision: loadedRevision }
     localStorage.setItem(LOCAL_STORAGE_KEY, JSON.stringify(stored))
     return stored
   }
@@ -23,14 +28,15 @@ export async function saveEncryptedVault({ userId, vaultId, envelope, revision =
   if (!vaultId) {
     const { data, error } = await supabase.from('vaults').insert({ user_id: userId, envelope, revision: 0, updated_at: new Date().toISOString() }).select('id,envelope,revision').single()
     if (error) throw error
-    return { id: data.id, envelope: data.envelope, revision: Number(data.revision || 0) }
+    loadedRevision = Number(data.revision || 0)
+    return { id: data.id, envelope: data.envelope, revision: loadedRevision }
   }
-  const nextRevision = Number(revision || 0) + 1
+  const nextRevision = loadedRevision + 1
   const { data, error } = await supabase.from('vaults')
     .update({ envelope, revision: nextRevision, updated_at: new Date().toISOString() })
     .eq('id', vaultId)
     .eq('user_id', userId)
-    .eq('revision', Number(revision || 0))
+    .eq('revision', loadedRevision)
     .select('id,envelope,revision')
     .maybeSingle()
   if (error) throw error
@@ -39,7 +45,8 @@ export async function saveEncryptedVault({ userId, vaultId, envelope, revision =
     conflict.code = 'VAULT_CONFLICT'
     throw conflict
   }
-  return { id: data.id, envelope: data.envelope, revision: Number(data.revision || nextRevision) }
+  loadedRevision = Number(data.revision || nextRevision)
+  return { id: data.id, envelope: data.envelope, revision: loadedRevision }
 }
 
 export function exportEncryptedBackup(envelope) {
